@@ -1,0 +1,7 @@
+/home/ghassen/Projects/distributed_systems_cap_assignement/src/main/java/com/tp/replication/utils/FileUtils.java
+/home/ghassen/Projects/distributed_systems_cap_assignement/src/main/java/com/tp/replication/client/ClientReaderV2.java
+/home/ghassen/Projects/distributed_systems_cap_assignement/src/main/java/com/tp/replication/client/ClientWriter.java
+/home/ghassen/Projects/distributed_systems_cap_assignement/src/main/java/com/tp/replication/replica/ReplicaService.java
+/home/ghassen/Projects/distributed_systems_cap_assignement/src/main/java/com/tp/replication/config/RabbitMQConfig.java
+/home/ghassen/Projects/distributed_systems_cap_assignement/src/main/java/com/tp/replication/TpCapReplicationApplication.java
+/home/ghassen/Projects/distributed_systems_cap_assignement/src/main/java/com/tp/replication/client/ClientReader.java

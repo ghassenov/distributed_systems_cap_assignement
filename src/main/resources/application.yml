@@ -1,0 +1,85 @@
+spring:
+  application:
+    name: tp-cap-replication
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+  profiles:
+    active: replica1
+
+logging:
+  level:
+    root: INFO
+    com.tp.replication: DEBUG
+
+replica:
+  count: 3
+
+client:
+  read-timeout-ms: 5000
+  read-all-timeout-ms: 5000
+
+---
+spring:
+  config:
+    activate:
+      on-profile: replica1
+
+replica:
+  id: replica1
+  data-dir: replica_data/replica1
+  write-queue: replica_write_replica1
+  read-queue: replica_read_replica1
+
+---
+spring:
+  config:
+    activate:
+      on-profile: replica2
+
+replica:
+  id: replica2
+  data-dir: replica_data/replica2
+  write-queue: replica_write_replica2
+  read-queue: replica_read_replica2
+
+---
+spring:
+  config:
+    activate:
+      on-profile: replica3
+
+replica:
+  id: replica3
+  data-dir: replica_data/replica3
+  write-queue: replica_write_replica3
+  read-queue: replica_read_replica3
+
+---
+spring:
+  config:
+    activate:
+      on-profile: writer
+  rabbitmq:
+    host: localhost
+    port: 5672
+
+---
+spring:
+  config:
+    activate:
+      on-profile: reader
+  rabbitmq:
+    host: localhost
+    port: 5672
+
+---
+spring:
+  config:
+    activate:
+      on-profile: readerv2
+  rabbitmq:
+    host: localhost
+    port: 5672

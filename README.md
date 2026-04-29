@@ -27,7 +27,7 @@ java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=re
 Write one line (or use interactive mode with no args):
 
 ```bash
-java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=writer "1 First line"
+java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=writer "First line"
 ```
 
 Read last line (availability-first):
@@ -44,7 +44,7 @@ java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=re
 
 ## Message Formats
 
-- Write: any text line (recommended format: "<number> <text>")
+- Write: any text line
 - READ_LAST request: `READ_LAST:<correlationId>:<replyQueueName>`
 - READ_LAST response: `<correlationId>|<lastLine>`
 - READ_ALL request: `READ_ALL:<correlationId>:<replyQueueName>`
@@ -82,9 +82,9 @@ java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=re
 Write a few lines:
 
 ```bash
-java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=writer "1 First line"
-java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=writer "2 Second line"
-java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=writer "3 Third line"
+java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=writer "First line"
+java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=writer "Second line"
+java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=writer "Third line"
 ```
 
 Expected file changes:
@@ -110,8 +110,8 @@ Expected file changes:
 Stop replica2 (Ctrl+C in its terminal), then write new lines:
 
 ```bash
-java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=writer "4 After failure"
-java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=writer "5 More data"
+java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=writer "After failure"
+java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=writer "More data"
 ```
 
 Expected file changes:
@@ -140,21 +140,21 @@ java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=re
 
 Expected file changes:
 
-- No file changes. The client prints a reconciled view using majority voting (lines present in at least two replicas).
+- No file changes. The client prints a reconciled view using majority voting by line position, keeping the value seen in at least two replicas.
 
 ### Scenario 5: Manual Divergence and Reconcile
 
 Manually introduce a conflicting line in replica2, then reconcile:
 
 ```bash
-echo "2 Different version" >> replica_data/replica2/data.txt
+echo "Different version" >> replica_data/replica2/data.txt
 java -jar target/tp-cap-replication-1.0-SNAPSHOT.jar --spring.profiles.active=readerv2
 ```
 
 Expected file changes:
 
 - [replica_data/replica2/data.txt](replica_data/replica2/data.txt) contains the conflicting line.
-- The majority result should still favor the value present in at least two replicas.
+- The majority result should still favor the value present in at least two replicas for the affected line position.
 
 ## Configuration
 

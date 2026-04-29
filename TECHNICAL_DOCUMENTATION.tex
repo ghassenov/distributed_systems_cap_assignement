@@ -1,0 +1,539 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{longtable}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  pdftitle={TP CAP Replication Technical Document}
+}
+
+\lstdefinestyle{javaStyle}{
+  language=Java,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue}\bfseries,
+  commentstyle=\color{gray},
+  stringstyle=\color{teal!70!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  stepnumber=1,
+  numbersep=8pt,
+  frame=single,
+  breaklines=true,
+  tabsize=2,
+  showstringspaces=false,
+  columns=fullflexible
+}
+
+\lstset{style=javaStyle}
+
+\title{TP CAP Replication with RabbitMQ}
+\author{Technical Documentation}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This project implements a small distributed replication system using Spring Boot and RabbitMQ. Three independent replicas store data in local files, a writer broadcasts updates to every replica, and two reader modes demonstrate the trade-off between availability and consistency. This document explains the architecture, the message flow, the storage model, the client behavior, and the failure scenarios directly reflected in the source code.
+\end{abstract}
+
+\tableofcontents
+
+\section{System Overview}
+
+The application is organized as a single Spring Boot jar that can run in multiple modes through Spring profiles. The same codebase starts as one of four roles:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{replica1, replica2, replica3}: listen for write messages and serve read requests.
+  \item \textbf{writer}: send new lines to the replication fanout exchange.
+  \item \textbf{reader}: request the last line from the first replica that answers.
+  \item \textbf{readerv2}: request all lines from every replica and reconcile them using majority voting.
+\end{itemize}
+
+The design is intentionally simple: all persistent state is stored as plain text files under \texttt{replica\_data/}. This makes the replication behavior easy to inspect and also makes divergence visible when one replica misses a write.
+
+\section{Build and Runtime Model}
+
+The main entry point is the standard Spring Boot launcher:
+
+\begin{lstlisting}
+package com.tp.replication;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class TpCapReplicationApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(TpCapReplicationApplication.class, args);
+    }
+}
+\end{lstlisting}
+
+There is no custom bootstrap logic here. All behavior is attached through profile-scoped beans, RabbitMQ listeners, and \texttt{CommandLineRunner} implementations. That means the same jar can play very different roles depending on the active profile passed at startup.
+
+\section{Configuration and Profiles}
+
+The runtime configuration lives in \texttt{application.yml}. The root profile defines the shared defaults, and each replica profile injects its own identity, data directory, and queue names.
+
+\begin{lstlisting}
+spring:
+  application:
+    name: tp-cap-replication
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+  profiles:
+    active: replica1
+
+replica:
+  count: 3
+
+client:
+  read-timeout-ms: 5000
+  read-all-timeout-ms: 5000
+\end{lstlisting}
+
+Each replica profile adds the values needed by \texttt{ReplicaService}:
+
+\begin{lstlisting}
+replica:
+  id: replica1
+  data-dir: replica_data/replica1
+  write-queue: replica_write_replica1
+  read-queue: replica_read_replica1
+\end{lstlisting}
+
+This profile-based design is important because it avoids duplicating code across three separate applications. Instead, one service class reads its queue and file settings from the active profile and behaves like a distinct replica.
+
+\section{RabbitMQ Topology}
+
+RabbitMQ is used as the transport layer between clients and replicas. The configuration defines two fanout exchanges and separate replica queues for writes and reads.
+
+\begin{lstlisting}
+@Configuration
+public class RabbitMQConfig {
+
+    public static final String WRITE_EXCHANGE = "write_exchange";
+    public static final String READ_REQUEST_EXCHANGE = "read_request_exchange";
+
+    @Bean
+    public FanoutExchange writeExchange() {
+        return new FanoutExchange(WRITE_EXCHANGE, true, false);
+    }
+
+    @Bean
+    public FanoutExchange readRequestExchange() {
+        return new FanoutExchange(READ_REQUEST_EXCHANGE, true, false);
+    }
+\end{lstlisting}
+
+The important architectural choice is the use of a fanout exchange. A fanout exchange delivers every message to every bound queue, which is exactly what a replication demo needs for write propagation and broadcast reads.
+
+The configuration then creates one write queue and one read queue per replica and binds them to the exchanges:
+
+\begin{lstlisting}
+@Bean
+public Queue replicaWriteQueue1() {
+    return new Queue(REPLICA1_WRITE_QUEUE, false, false, true);
+}
+
+@Bean
+public Binding replicaQueueBinding1(Queue replicaWriteQueue1, FanoutExchange writeExchange) {
+    return BindingBuilder.bind(replicaWriteQueue1).to(writeExchange);
+}
+\end{lstlisting}
+
+The queue flags mean the queues are non-durable, non-exclusive, and auto-delete. In practice this keeps the demo lightweight and disposable: when a replica process disappears, its queues do not need to persist as durable broker state.
+
+\section{Local Persistence Model}
+
+The replicas do not use a database. Instead, each replica appends to a single text file. That decision keeps the system easy to understand and creates a visible consistency story: if a replica misses a message, its file diverges from the others.
+
+\begin{lstlisting}
+public static void appendLine(String filePath, String line) {
+    try {
+        Path path = Paths.get(filePath);
+        Files.createDirectories(path.getParent());
+
+        String content = line + System.lineSeparator();
+        Files.write(path, content.getBytes(StandardCharsets.UTF_8),
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+    } catch (IOException e) {
+        logger.error("Failed to append to {}: {}", filePath, e);
+    }
+}
+\end{lstlisting}
+
+This method is the basic write primitive used by every replica. It creates the parent directory if needed, appends a newline-terminated record, and logs failures instead of crashing the process.
+
+The read helpers are equally direct:
+
+\begin{lstlisting}
+public static String readLastLine(String filePath) {
+    try {
+        Path path = Paths.get(filePath);
+        if (!Files.exists(path)) {
+            return "";
+        }
+
+        List<String> lines = Files.readAllLines(path, StandardCharsets.UTF_8);
+        if (lines.isEmpty()) {
+            return "";
+        }
+        return lines.get(lines.size() - 1);
+    } catch (IOException e) {
+        logger.error("Failed to read last line from {}: {}", filePath, e);
+        return "";
+    }
+}
+\end{lstlisting}
+
+The file helper returns an empty string when the file is missing or empty. That behavior keeps the reader clients simple because they can treat the absence of data as a valid, handled case.
+
+\section{Replica Service}
+
+\texttt{ReplicaService} is the core server-side component. It is only active under the replica profiles, and it handles both writes and read requests.
+
+\subsection{Initialization}
+
+On startup, the service computes the local data file path and ensures the replica directory exists.
+
+\begin{lstlisting}
+@PostConstruct
+public void init() {
+    if (replicaId != null && !replicaId.isEmpty()) {
+        dataFilePath = dataDir + "/data.txt";
+        FileUtils.ensureDirectory(dataDir);
+        logger.info("Replica {} initialized with data directory: {}", replicaId, dataDir);
+    }
+}
+\end{lstlisting}
+
+This is a small but important step. The data path is not hardcoded; it comes from the active profile so each process writes to a different file tree.
+
+\subsection{Write Path}
+
+The write listener receives plain text lines from the \texttt{write\_exchange} fanout exchange.
+
+\begin{lstlisting}
+@RabbitListener(queues = "${replica.write-queue}")
+public void handleWrite(String message) {
+    logger.info("[{}] Received write message: {}", replicaId, message);
+    FileUtils.appendLine(dataFilePath, message);
+    logger.info("[{}] Data persisted to {}", replicaId, dataFilePath);
+}
+\end{lstlisting}
+
+The method is intentionally minimal: every replica performs the same append locally. There is no consensus protocol and no coordination between replicas. The broker delivers the message, and each replica persists it independently.
+
+\subsection{Read Request Parsing}
+
+Read requests arrive on the replica-specific read queue and are parsed using a simple colon-delimited protocol.
+
+\begin{lstlisting}
+@RabbitListener(queues = "${replica.read-queue}")
+public void handleReadRequest(String message) {
+    String[] parts = message.split(":", 3);
+    if (parts.length < 3) {
+        logger.warn("[{}] Invalid read request format: {}", replicaId, message);
+        return;
+    }
+
+    String requestType = parts[0];
+    String correlationId = parts[1];
+    String replyQueueName = parts[2];
+
+    if ("READ_LAST".equals(requestType)) {
+        handleReadLast(correlationId, replyQueueName);
+    } else if ("READ_ALL".equals(requestType)) {
+        handleReadAll(correlationId, replyQueueName);
+    }
+}
+\end{lstlisting}
+
+This protocol makes the request structure explicit:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \texttt{READ\_LAST:<correlationId>:<replyQueueName>}
+  \item \texttt{READ\_ALL:<correlationId>:<replyQueueName>}
+\end{itemize}
+
+The correlation identifier allows the client to ignore stray replies from older requests, and the reply queue name tells replicas where to send the answer.
+
+\subsection{READ\_LAST Scenario}
+
+The availability-oriented read path returns only the last line from one replica.
+
+\begin{lstlisting}
+private void handleReadLast(String correlationId, String replyQueueName) {
+    String lastLine = FileUtils.readLastLine(dataFilePath);
+    String response = correlationId + "|" + lastLine;
+
+    rabbitTemplate.convertAndSend(replyQueueName, response);
+    logger.info("[{}] Sent READ_LAST response to {}: {}", replicaId, replyQueueName, response);
+}
+\end{lstlisting}
+
+The response format is compact: \texttt{<correlationId>|<lastLine>}. A replica may return an empty last line if its file is empty, and the client treats the first arriving valid reply as sufficient.
+
+\subsection{READ\_ALL Scenario}
+
+The consistency-oriented path returns every local line, followed by an end marker.
+
+\begin{lstlisting}
+private void handleReadAll(String correlationId, String replyQueueName) {
+    List<String> allLines = FileUtils.readAllLines(dataFilePath);
+
+    for (String line : allLines) {
+        String response = correlationId + "|" + replicaId + "|" + line;
+        rabbitTemplate.convertAndSend(replyQueueName, response);
+    }
+
+    String endMarker = correlationId + "|END|" + replicaId;
+    rabbitTemplate.convertAndSend(replyQueueName, endMarker);
+}
+\end{lstlisting}
+
+This is the key mechanism that enables client-side reconciliation. Every line is sent separately, and the client waits until it sees an \texttt{END} marker from each replica or until the timeout expires.
+
+\section{Client Writer}
+
+The writer is a profile-scoped command-line runner. It either sends one line from the command line or enters an interactive loop.
+
+\begin{lstlisting}
+@Override
+public void run(String... args) throws Exception {
+    List<String> inputArgs = applicationArguments.getNonOptionArgs();
+
+    if (!inputArgs.isEmpty()) {
+        String line = String.join(" ", inputArgs);
+        sendLine(line);
+    } else {
+        Scanner scanner = new Scanner(System.in);
+        while (true) {
+            String line = scanner.nextLine();
+            if ("exit".equalsIgnoreCase(line)) {
+                break;
+            }
+            if (!line.trim().isEmpty()) {
+                sendLine(line);
+            }
+        }
+    }
+
+    System.exit(0);
+}
+\end{lstlisting}
+
+The actual send operation publishes to the fanout exchange:
+
+\begin{lstlisting}
+private void sendLine(String line) {
+    rabbitTemplate.convertAndSend(RabbitMQConfig.WRITE_EXCHANGE, "", line);
+    System.out.println("Sent: " + line);
+}
+\end{lstlisting}
+
+Because the exchange is fanout, the routing key is not used. The broker broadcasts the same payload to every bound replica queue.
+
+\section{Client Reader: Availability-First Read}
+
+\texttt{ClientReader} implements the simpler read mode. It asks every replica for the last line, but it accepts the first reply that comes back.
+
+\begin{lstlisting}
+String correlationId = UUID.randomUUID().toString();
+String replyQueueName = "reply_" + correlationId;
+
+Queue replyQueue = new Queue(replyQueueName, false, false, true);
+rabbitAdmin.declareQueue(replyQueue);
+
+CountDownLatch latch = new CountDownLatch(1);
+AtomicReference<String> result = new AtomicReference<>();
+\end{lstlisting}
+
+The client creates a temporary exclusive queue for replies. That queue exists only for the duration of the request and is deleted afterwards.
+
+The listener waits for the first reply and stores it:
+
+\begin{lstlisting}
+container.setMessageListener(message -> {
+    String reply = new String(message.getBody());
+    result.set(reply);
+    latch.countDown();
+});
+\end{lstlisting}
+
+Then it sends the request:
+
+\begin{lstlisting}
+String request = "READ_LAST:" + correlationId + ":" + replyQueueName;
+rabbitTemplate.convertAndSend(RabbitMQConfig.READ_REQUEST_EXCHANGE, "", request);
+\end{lstlisting}
+
+Finally, it waits up to the configured timeout and prints the returned last line if one arrives.
+
+This mode models an availability-oriented decision: the client prefers a quick answer over a globally reconciled one. If multiple replicas disagree, the client does not try to resolve the conflict here.
+
+\section{Client Reader V2: Majority Voting Read}
+
+The second reader mode is more elaborate. It asks every replica for all of its lines and then performs a quorum-based merge.
+
+\subsection{Data Collection}
+
+The client tracks two structures: one for the lines received from each replica and one for the replicas that have sent their \texttt{END} marker.
+
+\begin{lstlisting}
+Map<String, Set<String>> replicaLines = new HashMap<>();
+Map<String, Boolean> replicaEnded = new HashMap<>();
+Object lock = new Object();
+\end{lstlisting}
+
+Each message is parsed into three parts. A data message has the form \texttt{correlationId|replicaId|line}. An end marker has the form \texttt{correlationId|END|replicaId}.
+
+\begin{lstlisting}
+String[] parts = reply.split("\\|", 3);
+String corrId = parts[0];
+String replicaId = parts[1];
+String content = parts[2];
+
+if ("END".equals(replicaId)) {
+    replicaEnded.put(content, true);
+} else {
+    replicaLines.computeIfAbsent(replicaId, k -> new HashSet<>()).add(content);
+}
+\end{lstlisting}
+
+The code ignores replies whose correlation identifier does not match the current request. That matters because temporary reply queues and asynchronous delivery can otherwise cause stale messages to leak into a new read.
+
+\subsection{Waiting for Replica Completion}
+
+The client waits until every replica has sent an end marker or the timeout expires.
+
+\begin{lstlisting}
+while (System.currentTimeMillis() - startTime < readAllTimeoutMs) {
+    synchronized (lock) {
+        if (replicaEnded.size() >= replicaCount) {
+            break;
+        }
+    }
+    Thread.sleep(100);
+}
+\end{lstlisting}
+
+This makes the behavior deterministic enough for the demo while still tolerating partial failures. If a replica is down, the timeout will expire and the client will reconcile whatever data it has received.
+
+\subsection{Majority Voting}
+
+The reconciliation logic counts how many replicas produced each exact line, then keeps only the values that appear in a majority of replicas.
+
+\begin{lstlisting}
+private void applyMajorityVoting(Map<String, Set<String>> replicaLines) {
+    Map<String, Integer> lineVotes = new HashMap<>();
+    for (String replicaId : replicaLines.keySet()) {
+        for (String line : replicaLines.get(replicaId)) {
+            lineVotes.put(line, lineVotes.getOrDefault(line, 0) + 1);
+        }
+    }
+
+    Map<Integer, String> finalLines = new TreeMap<>();
+    int requiredVotes = (replicaCount / 2) + 1;
+    for (String line : lineVotes.keySet()) {
+        int votes = lineVotes.get(line);
+        if (votes >= requiredVotes) {
+            String[] parts = line.split(" ", 2);
+            int lineNum = Integer.parseInt(parts[0]);
+            finalLines.put(lineNum, line);
+        }
+    }
+}
+\end{lstlisting}
+
+The majority threshold is computed as \texttt{(replicaCount / 2) + 1}. With three replicas, the threshold is two votes. This means a line must be present in at least two replicas to survive reconciliation.
+
+The implementation assumes the first token of each line is a numeric prefix, such as \texttt{1 First line}. This is how the final output is sorted by line number. If a line cannot be parsed, it is skipped with a warning. That is a pragmatic choice for the assignment because the demo format naturally uses numbered records.
+
+\section{Message Formats}
+
+The codebase uses explicit string formats instead of serializing structured objects. This keeps the messaging easy to inspect during debugging.
+
+\begin{longtable}{|p{0.28\textwidth}|p{0.62\textwidth}|}
+\hline
+\textbf{Purpose} & \textbf{Format} \\
+\hline
+Write request & Any plain line of text, often \texttt{<number> <content>} \\
+\hline
+READ\_LAST request & \texttt{READ\_LAST:<correlationId>:<replyQueueName>} \\
+\hline
+READ\_LAST response & \texttt{<correlationId>|<lastLine>} \\
+\hline
+READ\_ALL request & \texttt{READ\_ALL:<correlationId>:<replyQueueName>} \\
+\hline
+READ\_ALL data response & \texttt{<correlationId>|<replicaId>|<line>} \\
+\hline
+READ\_ALL end marker & \texttt{<correlationId>|END|<replicaId>} \\
+\hline
+\end{longtable}
+
+These conventions are the glue that lets the reader clients interpret asynchronous replies safely.
+
+\section{Scenarios and What They Demonstrate}
+
+\subsection{All Replicas Healthy}
+
+When all replicas are running, every write is appended to all three local files. In this case, \texttt{reader} and \texttt{readerv2} usually return the same logical result because the replicas agree.
+
+\subsection{Replica Down During Writes}
+
+If one replica is offline, it misses the write messages published while it is down. When it comes back later, it does not automatically recover missing lines. This creates a visible divergence between the files.
+
+This scenario is essential to the project because it shows why replication alone does not guarantee consistency. Delivery failures and downtime create disagreement unless there is a repair protocol.
+
+\subsection{READ\_LAST as an Availability-First Choice}
+
+The simple reader chooses the first replica that replies. This gives a fast answer and keeps the read path resilient to slow or failing replicas, but it does not guarantee that the answer reflects the majority state.
+
+\subsection{READ\_ALL with Majority Voting}
+
+The second reader gathers all visible lines and then applies quorum logic. In the normal three-replica setup, a line survives only if at least two replicas agree on it.
+
+This is the code path that best illustrates the CAP trade-off in the project. It sacrifices simplicity and latency for a stronger reconciliation result.
+
+\subsection{Empty Files and Missing Data}
+
+The helper methods return empty values rather than throwing exceptions when files are missing or empty. That makes the entire system more robust during startup and after a fresh deployment.
+
+\subsection{Malformed or Conflicting Lines}
+
+The reconciliation code expects lines to begin with a numeric prefix. If that assumption is violated, the line is skipped. This is not a general-purpose merge algorithm; it is a project-specific reconciliation strategy tailored to the expected input format.
+
+\section{What Each Class Is Responsible For}
+
+\begin{itemize}[leftmargin=1.4em]
+  \item \textbf{TpCapReplicationApplication}: starts Spring Boot.
+  \item \textbf{RabbitMQConfig}: declares exchanges, queues, and bindings.
+  \item \textbf{FileUtils}: handles directory creation and file reads and writes.
+  \item \textbf{ReplicaService}: persists writes and answers read requests.
+  \item \textbf{ClientWriter}: publishes writes to the broker.
+  \item \textbf{ClientReader}: reads one last line from the first responsive replica.
+  \item \textbf{ClientReaderV2}: aggregates all replica data and reconciles it by majority.
+\end{itemize}
+
+\section{Conclusion}
+
+The project is a compact but instructive replication example. It combines Spring Boot profiles, RabbitMQ fanout exchanges, temporary reply queues, and file-based persistence to demonstrate how a distributed system can prefer either quick availability or a more consistent merged view. The code is intentionally direct, which makes it well suited for teaching, debugging, and documenting the basic mechanics of replication under partial failure.
+
+\end{document}

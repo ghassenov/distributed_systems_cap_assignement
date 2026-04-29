@@ -50,7 +50,7 @@ public class ClientReaderV2 implements CommandLineRunner {
         logger.info("Created temporary reply queue: {}", replyQueueName);
 
         // Track received lines by replica
-        Map<String, Set<String>> replicaLines = new HashMap<>();
+        Map<String, List<String>> replicaLines = new LinkedHashMap<>();
         Map<String, Boolean> replicaEnded = new HashMap<>();
         Object lock = new Object();
 
@@ -78,7 +78,7 @@ public class ClientReaderV2 implements CommandLineRunner {
                         logger.info("Received END from replica: {}", content);
                     } else {
                         // Data line
-                        replicaLines.computeIfAbsent(replicaId, k -> new HashSet<>()).add(content);
+                        replicaLines.computeIfAbsent(replicaId, k -> new ArrayList<>()).add(content);
                         logger.debug("Stored line from {}: {}", replicaId, content);
                     }
                 } else {
@@ -115,33 +115,37 @@ public class ClientReaderV2 implements CommandLineRunner {
         }
     }
 
-    private void applyMajorityVoting(Map<String, Set<String>> replicaLines) {
+    private void applyMajorityVoting(Map<String, List<String>> replicaLines) {
         logger.info("Applying majority voting with replica data: {}", replicaLines);
 
-        // Collect all lines from all replicas
-        Map<String, Integer> lineVotes = new HashMap<>();
-        for (String replicaId : replicaLines.keySet()) {
-            for (String line : replicaLines.get(replicaId)) {
-                lineVotes.put(line, lineVotes.getOrDefault(line, 0) + 1);
-            }
-        }
-
-        // Extract line numbers and find winners
+        // Vote by line position so arbitrary text lines keep their original order.
         Map<Integer, String> finalLines = new TreeMap<>();
         int requiredVotes = (replicaCount / 2) + 1;
-        for (String line : lineVotes.keySet()) {
-            int votes = lineVotes.get(line);
-            if (votes >= requiredVotes) {
-                try {
-                    // Parse line number from the beginning
-                    String[] parts = line.split(" ", 2);
-                    if (parts.length >= 1) {
-                        int lineNum = Integer.parseInt(parts[0]);
-                        finalLines.put(lineNum, line);
-                    }
-                } catch (NumberFormatException e) {
-                    logger.warn("Could not parse line number from: {}", line);
+        int maxLineCount = 0;
+        for (List<String> lines : replicaLines.values()) {
+            maxLineCount = Math.max(maxLineCount, lines.size());
+        }
+
+        for (int lineIndex = 0; lineIndex < maxLineCount; lineIndex++) {
+            Map<String, Integer> votesAtIndex = new HashMap<>();
+            for (List<String> lines : replicaLines.values()) {
+                if (lineIndex < lines.size()) {
+                    String line = lines.get(lineIndex);
+                    votesAtIndex.put(line, votesAtIndex.getOrDefault(line, 0) + 1);
                 }
+            }
+
+            String winningLine = null;
+            int winningVotes = 0;
+            for (Map.Entry<String, Integer> entry : votesAtIndex.entrySet()) {
+                if (entry.getValue() > winningVotes) {
+                    winningLine = entry.getKey();
+                    winningVotes = entry.getValue();
+                }
+            }
+
+            if (winningLine != null && winningVotes >= requiredVotes) {
+                finalLines.put(lineIndex + 1, winningLine);
             }
         }
 

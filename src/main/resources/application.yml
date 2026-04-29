@@ -30,8 +30,8 @@ spring:
 replica:
   id: replica1
   data-dir: replica_data/replica1
-  write-queue: replica_write_replica1
-  read-queue: replica_read_replica1
+  write-queue: replica_write_replica1_ephemeral
+  read-queue: replica_read_replica1_ephemeral
 
 ---
 spring:
@@ -42,8 +42,8 @@ spring:
 replica:
   id: replica2
   data-dir: replica_data/replica2
-  write-queue: replica_write_replica2
-  read-queue: replica_read_replica2
+  write-queue: replica_write_replica2_ephemeral
+  read-queue: replica_read_replica2_ephemeral
 
 ---
 spring:
@@ -54,8 +54,8 @@ spring:
 replica:
   id: replica3
   data-dir: replica_data/replica3
-  write-queue: replica_write_replica3
-  read-queue: replica_read_replica3
+  write-queue: replica_write_replica3_ephemeral
+  read-queue: replica_read_replica3_ephemeral
 
 ---
 spring:
